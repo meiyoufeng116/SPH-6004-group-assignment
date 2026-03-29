@@ -1,0 +1,603 @@
+---
+title: "Cohort_Selection"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+library(data.table)
+library(ggplot2)
+library(tidyr)
+library(tidyverse) 
+library(readxl)
+library(gdata)
+library(lubridate)
+library(comorbidity)
+library(table1)
+library(bigrquery)
+library(DBI)
+library(dbplyr)
+library(dplyr)
+library(broom)
+library(patchwork)
+library(writexl)
+```
+
+
+## Load data
+```{r,echo = F,include = F}
+# User prompt: in Load data chunk, replace NULL with NA for all tables
+
+
+data_static = fread("MIMIC-IV-static(Group Assignment).csv")
+data_ts = fread("MIMIC-IV-time_series(Group Assignment).csv")
+data_text = fread("MIMIC-IV-text(Group Assignment).csv")
+
+replace_null_with_na = function(df) {
+  df = df %>%
+    mutate(
+      across(where(is.character), ~ na_if(.x, "NULL")),
+      across(where(is.factor), ~ as.factor(na_if(as.character(.x), "NULL")))
+    )
+  for (nm in names(df)) {
+    if (is.list(df[[nm]])) {
+      df[[nm]] = lapply(df[[nm]], function(x) if (is.null(x)) NA else x)
+    }
+  }
+  df
+}
+
+data_static = replace_null_with_na(data_static)
+data_ts = replace_null_with_na(data_ts)
+data_text = replace_null_with_na(data_text)
+
+
+data_text = data_text%>%filter(!is.na(radiology_note_time_min))
+
+# Join radiology text to static cohort and label notes charted before ICU intime.
+data_static_text = data_static %>%
+  left_join(
+    data_text %>% select(subject_id, stay_id, radiology_note_time_min),
+    by = c("subject_id", "stay_id")
+  ) %>%
+  mutate(
+    radiology_note_before_intime = if_else(
+      !is.na(radiology_note_time_min) & radiology_note_time_min < intime,
+      1L,
+      0L
+    ),
+    radiology_note_intime_diff_hours = as.numeric(
+      difftime(intime, radiology_note_time_min, units = "hours")
+    )
+  )
+
+summary(data_static_text$radiology_note_intime_diff_hours)
+
+
+
+data_ts = data_ts %>%
+  left_join(
+    data %>% select(stay_id, intime),
+    by = "stay_id"
+  ) %>%
+  mutate(
+    hour = as.numeric(
+      difftime(
+        as.POSIXct(hour_ts, tz = "UTC"),
+        as.POSIXct(intime, tz = "UTC"),
+        units = "hours"
+      )
+    ),
+    hour_3h = floor(hour / 3) * 3,
+    hour_6h = floor(hour / 6) * 6,
+    hour_12h = floor(hour / 12) * 12
+  )
+```
+
+
+## Cohort Selection
+```{r,echo=FALSE}
+data = data_static_text%>%filter(radiology_note_intime_diff_hours >-6)# first selection
+data = data%>%filter(first_careunit%in%c("Medical Intensive Care Unit (MICU)"))## second selection
+data = data %>%
+  group_by(subject_id) %>%
+  arrange(intime, .by_group = TRUE) %>%
+  slice(1) %>%
+  ungroup()## third selection, first stay 
+
+data_ts = data_ts%>%filter(stay_id%in%data$stay_id)
+length(unique(data$subject_id))
+
+data_text = data_text%>%filter(stay_id%in%data$stay_id)
+```
+
+## Temperal Trend
+```{r,echo=FALSE}
+death_rate_by_day = data %>%
+  mutate(
+    los_day = floor(los),
+    death_flag = as.integer(icu_death_flag == 1)
+  ) %>%
+  filter(!is.na(los_day), !is.na(death_flag)) %>%
+  group_by(los_day) %>%
+  summarise(
+    n_patients = n(),
+    n_deaths = sum(death_flag),
+    death_rate = n_deaths / n_patients,
+    .groups = "drop"
+  ) %>%
+  arrange(los_day)
+
+overall_death_rate = mean(data$icu_death_flag == 1, na.rm = TRUE)
+
+death_rate_by_day = death_rate_by_day %>%
+  filter(los_day >= 0, los_day <= 6) %>%
+  rowwise() %>%
+  mutate(
+    p_value = if (n_patients > 0) {
+      prop.test(
+        x = n_deaths,
+        n = n_patients,
+        p = overall_death_rate
+      )$p.value
+    } else {
+      NA_real_
+    }
+  ) %>%
+  ungroup()
+
+knitr::kable(
+  death_rate_by_day,
+  format = "html",
+  digits = 4,
+  caption = "Daily ICU Death Rate (First 7 Days) With P-values vs Overall Death Rate"
+)
+
+#### Remove first day
+data = data%>%filter(los > 1)
+data_ts = data_ts%>%filter(stay_id%in%data$stay_id)
+```
+
+## TS processing
+```{r, echo = FALSE}
+# User prompt: in the chunk TS processing, also create data_ts_3h and data_ts_12h for
+# User prompt: In TS processing chunk, for the three time series tables (3h, 6h and 12h) for all column names start with "sofa_" replace NA with 0, and then create a another column aggregate the maxiuium value of the previous 24hours (if possible) and store in a new column called "max24_sofa_"
+
+
+safe_max = function(x) {
+  if (all(is.na(x))) {
+    NA_real_
+  } else {
+    max(x, na.rm = TRUE)
+  }
+}
+
+ts_vars = c(
+  "hr", "map", "rr", "spo2", "temp", "gcs", "lactate", "creatinine",
+  "bilirubin", "platelets", "wbc", "sodium", "bun", "inr", "urine_output",
+  "vasopressor_dose", "fluid_input", "ventilation_flag", "sofa_resp",
+  "sofa_cardio", "sofa_renal", "sofa_liver", "sofa_coag", "sofa_cns"
+)
+
+data_ts = data_ts %>%
+  mutate(
+    across(any_of(ts_vars), ~ suppressWarnings(as.numeric(.x)))
+  )
+
+data_ts_6h = data_ts %>%
+  group_by(stay_id, hour_6h) %>%
+  summarise(
+    across(
+      any_of(ts_vars),
+      safe_max
+    ),
+    .groups = "drop"
+  ) %>%
+  arrange(stay_id, hour_6h)
+
+data_ts_3h = data_ts %>%
+  group_by(stay_id, hour_3h) %>%
+  summarise(
+    across(
+      any_of(ts_vars),
+      safe_max
+    ),
+    .groups = "drop"
+  ) %>%
+  arrange(stay_id, hour_3h)
+
+data_ts_12h = data_ts %>%
+  group_by(stay_id, hour_12h) %>%
+  summarise(
+    across(
+      any_of(ts_vars),
+      safe_max
+    ),
+    .groups = "drop"
+  ) %>%
+  arrange(stay_id, hour_12h)
+
+add_max24_sofa = function(df, hour_col, bin_hours) {
+  sofa_cols = names(df)[startsWith(names(df), "sofa_")]
+  if (length(sofa_cols) == 0) return(df)
+
+  window_n = max(1L, as.integer(24 / bin_hours))
+
+  df = df %>%
+    mutate(
+      across(any_of(sofa_cols), ~ tidyr::replace_na(.x, 0))
+    ) %>%
+    group_by(stay_id) %>%
+    arrange(.data[[hour_col]], .by_group = TRUE) %>%
+    group_modify(~ {
+      out = .x
+      for (col in sofa_cols) {
+        vals = out[[col]]
+        roll_max = sapply(
+          seq_along(vals),
+          function(i) {
+            start_i = max(1, i - window_n + 1)
+            max(vals[start_i:i], na.rm = TRUE)
+          }
+        )
+        out[[paste0("max24_", col)]] = as.numeric(roll_max)
+      }
+      out
+    }) %>%
+    ungroup()
+
+  df
+}
+
+data_ts_3h = add_max24_sofa(data_ts_3h, hour_col = "hour_3h", bin_hours = 3)
+data_ts_6h = add_max24_sofa(data_ts_6h, hour_col = "hour_6h", bin_hours = 6)
+data_ts_12h = add_max24_sofa(data_ts_12h, hour_col = "hour_12h", bin_hours = 12)
+
+```
+
+
+
+## Create labels feature engineering
+
+
+### TS Data Forward-Fill
+```{r}
+# User prompt: in. chunk "TS Data Forward-Fill" perform forward fill for variables of in the three ts tables, forward fill variables for 24 hours at most.
+
+ffill_limited = function(x, max_steps) {
+  out = x
+  last_val = NA
+  gap = 0L
+  has_last = FALSE
+
+  for (i in seq_along(out)) {
+    if (is.na(out[i])) {
+      if (has_last) {
+        gap = gap + 1L
+        if (gap <= max_steps) {
+          out[i] = last_val
+        }
+      }
+    } else {
+      last_val = out[i]
+      has_last = TRUE
+      gap = 0L
+    }
+  }
+
+  out
+}
+
+apply_ffill_24h = function(df, hour_col, bin_hours) {
+  fill_cols = setdiff(names(df), c("stay_id", hour_col))
+  max_steps = as.integer(24 / bin_hours)
+
+  df %>%
+    group_by(stay_id) %>%
+    arrange(.data[[hour_col]], .by_group = TRUE) %>%
+    mutate(
+      across(
+        all_of(fill_cols),
+        ~ ffill_limited(.x, max_steps = max_steps)
+      )
+    ) %>%
+    ungroup()
+}
+
+data_ts_3h = apply_ffill_24h(data_ts_3h, hour_col = "hour_3h", bin_hours = 3)
+data_ts_6h = apply_ffill_24h(data_ts_6h, hour_col = "hour_6h", bin_hours = 6)
+data_ts_12h = apply_ffill_24h(data_ts_12h, hour_col = "hour_12h", bin_hours = 12)
+
+
+```
+
+
+### Labels
+```{r, echo = FALSE}
+# User prompt: in the Create labels feature engineering chunk, create a new features for RACE (white, black, asian, other/unknown), Language (English, non-English), Insurance (Medicare and Medicate vs private vs others)
+# User prompt: in the same chunk, process any variable start with "sofa_" replace NULL with 0
+
+data = data %>%
+  mutate(
+    across(starts_with("sofa_"), ~ tidyr::replace_na(.x, 0))
+  ) %>%
+  mutate(
+    time_to_icu_discharge_hours = as.numeric(
+      difftime(
+        as.POSIXct(outtime, tz = "UTC"),
+        as.POSIXct(intime, tz = "UTC"),
+        units = "hours"
+      )
+    ),
+    time_to_icu_discharge_censored_hours = pmin(time_to_icu_discharge_hours, 24 * 7),
+    long_stay = if_else(
+      !is.na(time_to_icu_discharge_hours) & time_to_icu_discharge_hours > 24 * 7,
+      1L,
+      0L
+    ),
+    race_group = case_when(
+      str_detect(str_to_upper(race), "WHITE") ~ "white",
+      str_detect(str_to_upper(race), "BLACK") ~ "black",
+      str_detect(str_to_upper(race), "ASIAN") ~ "asian",
+      TRUE ~ "other/unknow"
+    ),
+    language_group = if_else(
+      str_detect(str_to_upper(language), "ENGL"),
+      "English",
+      "non-English"
+    ),
+    insurance_group = case_when(
+      str_detect(str_to_upper(insurance), "MEDICARE|MEDICAID") ~ "Medicare/Medicaid",
+      str_detect(str_to_upper(insurance), "PRIVATE") ~ "private",
+      TRUE ~ "others"
+    ),
+    time_to_icu_death_hours = if_else(
+      icu_death_flag == 1 & !is.na(deathtime),
+      as.numeric(
+        difftime(
+          as.POSIXct(deathtime, tz = "UTC"),
+          as.POSIXct(intime, tz = "UTC"),
+          units = "hours"
+        )
+      ),
+      NA_real_
+    )
+  )
+
+# Sofa
+
+```
+
+
+### Feature Selection
+```{r}
+# User prompt: In the feature selection chunk, create a new dataset called data_features by select variables below from the table data.
+# User prompt: Using the two time-to-event outcomes in "Labels" (time to discharge and time to death), build two Cox PH models with LASSO feature selection and store selected-feature datasets with names starting with "data_feature_", including stay_id and time/outcome variables first.
+# User prompt: relax features selection critiria for both models
+
+feature_vars = c(
+  "age", "marital_status", "heart_rate_max", "heart_rate_mean", "sbp_min",
+  "sbp_max", "sbp_mean", "dbp_min", "dbp_max", "dbp_mean", "mbp_min",
+  "mbp_max", "mbp_mean", "resp_rate_min", "resp_rate_max", "resp_rate_mean",
+  "temperature_min", "temperature_max", "temperature_mean", "spo2_min",
+  "spo2_max", "spo2_mean", "glucose_min", "glucose_max", "glucose_mean",
+  "gcs_min", "gcs_motor", "gcs_verbal", "gcs_eyes", "gcs_unable",
+  "hematocrit_min", "hematocrit_max", "hemoglobin_min", "hemoglobin_max",
+  "platelets_min", "platelets_max", "wbc_min", "wbc_max", "albumin_min",
+  "albumin_max", "globulin_min", "globulin_max", "total_protein_min",
+  "total_protein_max", "aniongap_min", "aniongap_max", "bicarbonate_min",
+  "bicarbonate_max", "bun_min", "bun_max", "calcium_min", "calcium_max",
+  "chloride_min", "chloride_max", "creatinine_min", "creatinine_max",
+  "sodium_min", "sodium_max", "potassium_min", "potassium_max",
+  "abs_basophils_min", "abs_basophils_max", "abs_eosinophils_min",
+  "abs_eosinophils_max", "abs_lymphocytes_min", "abs_lymphocytes_max",
+  "abs_monocytes_min", "abs_monocytes_max", "abs_neutrophils_min",
+  "abs_neutrophils_max", "atyps_min", "atyps_max", "bands_min", "bands_max",
+  "imm_granulocytes_min", "imm_granulocytes_max", "metas_min", "metas_max",
+  "nrbc_min", "nrbc_max", "d_dimer_min", "d_dimer_max", "fibrinogen_min",
+  "fibrinogen_max", "thrombin_min", "thrombin_max", "inr_min", "inr_max",
+  "pt_min", "pt_max", "ptt_min", "ptt_max", "alt_min", "alt_max", "alp_min",
+  "alp_max", "ast_min", "ast_max", "amylase_min", "amylase_max",
+  "bilirubin_total_min", "bilirubin_total_max", "bilirubin_direct_min",
+  "bilirubin_direct_max", "bilirubin_indirect_min", "bilirubin_indirect_max",
+  "ck_cpk_min", "ck_cpk_max", "ck_mb_min", "ck_mb_max", "ggt_min", "ggt_max",
+  "ld_ldh_min", "ld_ldh_max", "so2_min", "so2_max", "po2_min", "po2_max",
+   "time_to_icu_discharge_hours",
+  "time_to_icu_discharge_censored_hours", "long_stay", "race_group",
+  "language_group", "insurance_group"
+)
+
+data_features = data %>%
+  select(
+    stay_id,
+    icu_death_flag,
+    time_to_icu_discharge_hours,
+    time_to_icu_discharge_censored_hours,
+    time_to_icu_death_hours,
+    long_stay,
+    any_of(setdiff(
+      feature_vars,
+      c(
+        "time_to_icu_discharge_hours",
+        "time_to_icu_discharge_censored_hours",
+        "time_to_icu_death_hours",
+        "long_stay"
+      )
+    ))
+  )
+
+if (!requireNamespace("glmnet", quietly = TRUE)) {
+  stop("Package 'glmnet' is required for LASSO Cox modeling. Please install it first.")
+}
+if (!requireNamespace("survival", quietly = TRUE)) {
+  stop("Package 'survival' is required for Cox modeling. Please install it first.")
+}
+
+predictor_vars = setdiff(
+  feature_vars,
+  c(
+    "time_to_icu_discharge_hours",
+    "time_to_icu_discharge_censored_hours",
+    "time_to_icu_death_hours",
+    "long_stay"
+  )
+)
+
+fit_lasso_cox = function(df, time_var, event_var, predictors) {
+  model_df = df %>%
+    select(any_of(c(time_var, event_var, predictors))) %>%
+    filter(!is.na(.data[[time_var]]), .data[[time_var]] > 0, !is.na(.data[[event_var]]))
+
+  x_df = model_df %>%
+    select(any_of(predictors)) %>%
+    mutate(
+      across(
+        everything(),
+        ~ {
+          if (is.factor(.x) || is.character(.x)) {
+            as.numeric(as.factor(as.character(.x)))
+          } else if (is.logical(.x)) {
+            as.numeric(.x)
+          } else {
+            suppressWarnings(as.numeric(.x))
+          }
+        }
+      )
+    )
+
+  keep_cols = names(x_df)[sapply(x_df, function(col) {
+    vals = unique(col[!is.na(col)])
+    length(vals) >= 2
+  })]
+  x_df = x_df %>% select(any_of(keep_cols))
+
+  if (ncol(x_df) == 0 || nrow(x_df) < 10) {
+    return(list(selected_vars = character(0), selected_terms = character(0), cvfit = NULL))
+  }
+
+  for (j in seq_along(x_df)) {
+    if (anyNA(x_df[[j]])) {
+      med = median(x_df[[j]], na.rm = TRUE)
+      x_df[[j]][is.na(x_df[[j]])] = ifelse(is.finite(med), med, 0)
+    }
+  }
+  x = as.matrix(x_df)
+
+  y = survival::Surv(model_df[[time_var]], model_df[[event_var]])
+  cvfit = glmnet::cv.glmnet(x = x, y = y, family = "cox", alpha = 1, nfolds = 5)
+
+  coef_min = as.matrix(stats::coef(cvfit, s = "lambda.min"))[, 1]
+  selected_terms = names(coef_min)[coef_min != 0]
+
+  if (length(selected_terms) == 0) {
+    selected_terms = names(sort(abs(coef_min), decreasing = TRUE))[seq_len(min(10, length(coef_min)))]
+  }
+
+  selected_vars = intersect(predictors, selected_terms)
+
+  list(
+    selected_vars = unique(selected_vars),
+    selected_terms = selected_terms,
+    cvfit = cvfit
+  )
+}
+
+data_model = data_features %>%
+  mutate(
+    discharge_event_7d = if_else(
+      !is.na(time_to_icu_discharge_hours) & time_to_icu_discharge_hours <= 24 * 7,
+      1L,
+      0L
+    ),
+    death_event = if_else(!is.na(time_to_icu_death_hours) & icu_death_flag == 1, 1L, 0L),
+    death_time = if_else(
+      death_event == 1L,
+      time_to_icu_death_hours,
+      time_to_icu_discharge_censored_hours
+    )
+  )
+
+cox_lasso_discharge = fit_lasso_cox(
+  df = data_model,
+  time_var = "time_to_icu_discharge_censored_hours",
+  event_var = "discharge_event_7d",
+  predictors = predictor_vars
+)
+
+cox_lasso_death = fit_lasso_cox(
+  df = data_model,
+  time_var = "death_time",
+  event_var = "death_event",
+  predictors = predictor_vars
+)
+
+data_feature_discharge = data_model %>%
+  select(
+    stay_id,
+    time_to_icu_discharge_hours,
+    time_to_icu_discharge_censored_hours,
+    discharge_event_7d,
+    any_of(cox_lasso_discharge$selected_vars)
+  )
+
+data_feature_death = data_model %>%
+  select(
+    stay_id,
+    time_to_icu_death_hours,
+    death_time,
+    death_event,
+    any_of(cox_lasso_death$selected_vars)
+  )
+
+
+```
+
+
+## Output
+```{r}
+# User prompt: in the "Output" chunk, save the two existing table and also save the three ts tables, using function "fwrite" save under the default path and using the same names, save as .csv
+data_feature_death = left_join(data_feature_death,data_text%>%select(stay_id,radiology_note_text))
+
+data_feature_discharge = left_join(data_feature_discharge,data_text%>%select(stay_id,radiology_note_text))
+
+fwrite(data_feature_discharge, "data_feature_discharge.csv")
+fwrite(data_feature_death, "data_feature_death.csv")
+fwrite(data_ts_3h, "data_ts_3h.csv")
+fwrite(data_ts_6h, "data_ts_6h.csv")
+fwrite(data_ts_12h, "data_ts_12h.csv")
+
+
+
+
+
+
+```
+
+## Train-Test-Split
+```{r}
+
+# User prompt: this this chunk " baseline model " split "data" into train, validation and test with ratio 3:1:1.
+
+set.seed(123)
+
+n_total = nrow(data)
+n_train = floor(n_total * 3 / 5)
+n_valid = floor(n_total * 1 / 5)
+
+idx_all = if (n_total > 0) sample.int(n_total) else integer(0)
+idx_train = if (n_train > 0) idx_all[seq_len(n_train)] else integer(0)
+idx_valid = if (n_valid > 0) idx_all[seq.int(n_train + 1, n_train + n_valid)] else integer(0)
+idx_test_start = n_train + n_valid + 1
+idx_test = if (idx_test_start <= n_total) idx_all[seq.int(idx_test_start, n_total)] else integer(0)
+
+data_train = data[idx_train, ]
+data_valid = data[idx_valid, ]
+data_test = data[idx_test, ]
+
+```
+
+## CIF
+
+```{r}
+
+```
