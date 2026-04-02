@@ -3,7 +3,12 @@
     "allow": [
       "Bash(python3 -c \":*)",
       "Bash(python -c \"print\\(''hello''\\)\")",
-      "Bash(python -c \":*)"
+      "Bash(python -c \":*)",
+      "Bash(jupyter nbconvert:*)",
+      "Bash(python3 -m jupyter nbconvert --to script data_analysis.ipynb --stdout)",
+      "Bash(python3 -:*)",
+      "Bash(/raid/hpc/wufeng/miniconda3/envs/py3.10/bin/python3 -c \"import lifelines; print\\(''lifelines'', lifelines.__version__\\)\")",
+      "Bash(/raid/hpc/wufeng/miniconda3/envs/py3.10/bin/python3 -c \"import pandas, numpy, matplotlib; print\\(''pandas/numpy/matplotlib ok''\\)\")"
     ]
   }
 }
